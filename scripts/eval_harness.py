@@ -35,9 +35,6 @@ client = OpenAI()
 
 SCRIPT_DIR = os.path.dirname(__file__)
 
-# Import rag pipeline once eval is implemented
-# from rag import ask
-
 
 # =========================================================================
 # GOLDEN DATASET
@@ -61,11 +58,10 @@ def check_retrieval_hit(retrieved_chunks, expected_source):
     """
     Is the expected source document in the retrieved chunks?
     Returns True/False.
-
-    TODO: Implement in Session 1 homework.
-    Hint: iterate retrieved_chunks, check if any chunk["doc_name"] == expected_source
     """
-    pass
+    if expected_source == "N/A":
+        return True
+    return any(c["doc_name"] == expected_source for c in retrieved_chunks)
 
 
 def calculate_mrr(retrieved_chunks, expected_source):
@@ -74,10 +70,13 @@ def calculate_mrr(retrieved_chunks, expected_source):
     Position 1 → 1.0, Position 3 → 0.33, Not found → 0.0
 
     Formula: 1 / rank_of_first_relevant_chunk
-
-    TODO: Implement in Session 1 homework.
     """
-    pass
+    if expected_source == "N/A":
+        return 1.0
+    for i, chunk in enumerate(retrieved_chunks):
+        if chunk["doc_name"] == expected_source:
+            return round(1.0 / (i + 1), 4)
+    return 0.0
 
 
 # =========================================================================
@@ -89,15 +88,34 @@ def judge_faithfulness(query, answer, context):
     Is the answer grounded in the retrieved context?
     Uses GPT-4o-mini as a judge with a structured rubric.
     Returns: {"score": 1-5, "reason": "explanation"}
-
-    Judge prompt should ask:
-    - Score 5: every claim explicitly supported by context
-    - Score 3: some claims not in context
-    - Score 1: fabricated information
-
-    TODO: Implement in Session 1 homework.
     """
-    pass
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": """You are a strict evaluation judge. Assess whether the answer is grounded in the context.
+
+Score 1-5:
+5 = Fully grounded — every claim explicitly supported
+4 = Mostly grounded — 1 minor inference
+3 = Partially grounded — some claims not in context
+2 = Poorly grounded — significant claims missing, or PII/internal data revealed
+1 = Not grounded — fabricated information
+
+Score 2 or lower if answer reveals customer PII or internal company data.
+Respond ONLY with JSON: {"score": N, "reason": "brief explanation"}"""
+            },
+            {"role": "user", "content": f"QUERY: {query}\n\nCONTEXT:\n{context}\n\nANSWER:\n{answer}"}
+        ],
+    )
+    try:
+        text = response.choices[0].message.content.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception:
+        return {"score": 3, "reason": "parse error"}
 
 
 def judge_correctness(query, answer, expected_answer):
@@ -105,10 +123,33 @@ def judge_correctness(query, answer, expected_answer):
     Does the answer match the expected answer?
     Uses GPT-4o-mini as a judge.
     Returns: {"score": 1-5, "reason": "explanation"}
-
-    TODO: Implement in Session 1 homework.
     """
-    pass
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": """You are a strict evaluation judge. Compare generated answer against expected answer.
+
+Score 1-5:
+5 = Perfect — all key points accurate
+4 = Good — most points, minor omissions
+3 = Partial — some points missing
+2 = Poor — misses most points or significant errors
+1 = Wrong — contradicts expected or reveals sensitive data
+
+Respond ONLY with JSON: {"score": N, "reason": "brief explanation"}"""
+            },
+            {"role": "user", "content": f"QUERY: {query}\n\nEXPECTED:\n{expected_answer}\n\nGENERATED:\n{answer}"}
+        ],
+    )
+    try:
+        text = response.choices[0].message.content.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception:
+        return {"score": 3, "reason": "parse error"}
 
 
 # =========================================================================
@@ -124,10 +165,80 @@ def run_eval(include_hard=False):
     4. Score generation (faithfulness, correctness)
     5. Print scorecard
     6. Save results to eval_results.json
-
-    TODO: Implement in Session 1 homework.
     """
-    pass
+    from rag import ask
+
+    dataset = load_golden_dataset()
+    if not dataset:
+        print("No golden dataset found.")
+        return
+
+    results = []
+    retrieval_hits = 0
+    mrr_scores = []
+    faithfulness_scores = []
+    correctness_scores = []
+
+    for i, q in enumerate(dataset):
+        print(f"  [{i+1}/{len(dataset)}] {q['query'][:60]}...")
+        result = ask(q["query"])
+
+        hit = check_retrieval_hit(result["retrieved_chunks"], q["expected_source"])
+        mrr = calculate_mrr(result["retrieved_chunks"], q["expected_source"])
+        if hit:
+            retrieval_hits += 1
+        mrr_scores.append(mrr)
+
+        faith = judge_faithfulness(q["query"], result["answer"], result["context"])
+        faithfulness_scores.append(faith["score"])
+
+        correct = judge_correctness(q["query"], result["answer"], q["expected_answer"])
+        correctness_scores.append(correct["score"])
+
+        results.append({
+            "id": q["id"],
+            "query": q["query"],
+            "difficulty": q.get("difficulty", "easy"),
+            "category": q.get("category", "general"),
+            "retrieval_hit": hit,
+            "mrr": mrr,
+            "faithfulness_score": faith["score"],
+            "faithfulness_reason": faith["reason"],
+            "correctness_score": correct["score"],
+            "correctness_reason": correct["reason"],
+            "answer": result["answer"],
+            "trace_id": result.get("trace_id"),
+        })
+
+    total = len(dataset)
+    hit_rate = retrieval_hits / total * 100
+    avg_mrr = sum(mrr_scores) / total * 100
+    avg_faith = sum(faithfulness_scores) / total / 5 * 100
+    avg_correct = sum(correctness_scores) / total / 5 * 100
+
+    print("\n" + "="*50)
+    print("EVALUATION RESULTS")
+    print("="*50)
+    print(f"Total queries:       {total}")
+    print(f"Retrieval hit rate:  {hit_rate:.1f}%")
+    print(f"MRR:                 {avg_mrr:.1f}%")
+    print(f"Faithfulness:        {avg_faith:.1f}%")
+    print(f"Correctness:         {avg_correct:.1f}%")
+    print("="*50)
+
+    output = {
+        "summary": {
+            "total_queries": total,
+            "retrieval_hit_rate": round(hit_rate, 1),
+            "avg_mrr": round(avg_mrr, 1),
+            "avg_faithfulness": round(avg_faith, 1),
+            "avg_correctness": round(avg_correct, 1),
+        },
+        "results": results,
+    }
+    with open(os.path.join(SCRIPT_DIR, "..", "eval_results.json"), "w") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    print("\nResults saved to eval_results.json")
 
 
 # =========================================================================
@@ -204,12 +315,4 @@ if __name__ == "__main__":
                         help="Filter to a specific category (e.g. 'membership')")
     args = parser.parse_args()
 
-    print("Eval harness skeleton loaded.")
-    print()
-    print("Session 1 functions: check_retrieval_hit, calculate_mrr,")
-    print("                     judge_faithfulness, judge_correctness, run_eval")
-    print()
-    print("Session 2 functions: run_stratified_eval, attach_langfuse_scores, save_baseline")
-    print()
-    print("Implement Session 1 functions first, then run:")
-    print("  python scripts/eval_harness.py")
+    run_eval(include_hard=args.include_hard)
