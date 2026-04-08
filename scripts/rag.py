@@ -1,20 +1,21 @@
 """
-RAG pipeline — Session 3 update: Hybrid Search (BM25 + Dense + RRF).
+RAG pipeline — Session 4: Re-ranking + Context Engineering.
 
-New in Session 3:
-  - build_bm25_index()    — loads all chunks, builds in-memory BM25 index
-  - bm25_retrieve()       — lexical retrieval using BM25Okapi
-  - reciprocal_rank_fusion() — combines dense + BM25 rankings (RRF formula)
-  - hybrid_retrieve()     — full hybrid pipeline
-  - ask() now accepts mode="dense" (default) or mode="hybrid"
-  - ask_hybrid()          — convenience wrapper for hybrid mode
+Full pipeline progression:
+  Week 1: ask()          — dense retrieval → generate
+  Week 2: ask()          — same API, hybrid mode added
+  Session 3: ask_hybrid() — hybrid retrieval (BM25 + dense + RRF)
+  Session 4: ask_advanced() — hybrid + rerank + context assembly (dedup + expand + compress)
 
-Why hybrid? Dense embeddings are strong on semantics but miss exact keyword
-matches. BM25 is strong on keywords but blind to meaning. RRF fusion gets both.
+Session 4 additions:
+  - ask_advanced()       — full 4-stage pipeline
+  - run_ab_test()        — compare naive vs advanced on your eval set
 
 Run:
-    python scripts/rag.py                          # dense (default)
-    python scripts/rag.py --mode hybrid            # hybrid
+    python scripts/rag.py                              # dense (default)
+    python scripts/rag.py --mode hybrid               # Session 3 hybrid
+    python scripts/rag.py --mode advanced             # Session 4 full pipeline
+    python scripts/rag.py --mode advanced --query "..."
 """
 import os
 import sys
@@ -37,7 +38,7 @@ client = OpenAI()
 langfuse = Langfuse()
 
 TOP_K = 5
-BM25_CANDIDATES = TOP_K * 3   # retrieve more candidates before RRF fusion
+BM25_CANDIDATES = TOP_K * 3
 GENERATION_MODEL = "gpt-4o-mini"
 
 SYSTEM_PROMPT = """You are a helpful customer support assistant for Acmera, an Indian e-commerce company.
@@ -95,7 +96,6 @@ def retrieve(query_embedding, top_k=TOP_K):
         })
     cur.close()
     conn.close()
-
     langfuse_context.update_current_observation(metadata={
         "mode": "dense", "top_k": top_k,
         "results": [{"doc_name": r["doc_name"], "similarity": r["similarity"]} for r in results],
@@ -104,145 +104,90 @@ def retrieve(query_embedding, top_k=TOP_K):
 
 
 # =========================================================================
-# BM25 RETRIEVAL (Session 3)
+# BM25 + HYBRID (Session 3)
 # =========================================================================
 
 def _load_all_chunks():
-    """Fetch all chunks from DB for BM25 index construction."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, doc_name, chunk_index, content, metadata FROM chunks ORDER BY id")
     rows = cur.fetchall()
     cur.close()
     conn.close()
-
-    chunks = []
-    for row in rows:
-        chunks.append({
-            "id": row[0], "doc_name": row[1], "chunk_index": row[2],
-            "content": row[3],
-            "metadata": row[4] if isinstance(row[4], dict) else json.loads(row[4]),
-        })
-    return chunks
+    return [{
+        "id": row[0], "doc_name": row[1], "chunk_index": row[2],
+        "content": row[3],
+        "metadata": row[4] if isinstance(row[4], dict) else json.loads(row[4]),
+    } for row in rows]
 
 
 def build_bm25_index():
-    """
-    Load all chunks from DB and build an in-memory BM25 index.
-
-    Returns:
-        (bm25, all_chunks) — the BM25 index and the full chunk list it maps to
-    """
     all_chunks = _load_all_chunks()
-    tokenized_corpus = [chunk["content"].lower().split() for chunk in all_chunks]
-    bm25 = BM25Okapi(tokenized_corpus)
-    return bm25, all_chunks
+    tokenized = [c["content"].lower().split() for c in all_chunks]
+    return BM25Okapi(tokenized), all_chunks
 
 
 def bm25_retrieve(query, bm25, all_chunks, top_k=BM25_CANDIDATES):
-    """
-    Score all chunks with BM25 and return the top_k.
-    Adds 'bm25_score' key to each result dict.
-    """
-    tokenized_query = query.lower().split()
-    scores = bm25.get_scores(tokenized_query)
-
-    ranked = sorted(
-        enumerate(scores), key=lambda x: x[1], reverse=True
-    )[:top_k]
-
+    scores = bm25.get_scores(query.lower().split())
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
     results = []
     for idx, score in ranked:
         if score > 0:
             chunk = all_chunks[idx].copy()
             chunk["bm25_score"] = round(float(score), 4)
-            chunk["similarity"] = 0.0  # filled in if also in dense results
+            chunk["similarity"] = 0.0
             results.append(chunk)
-
     return results
 
 
-# =========================================================================
-# RECIPROCAL RANK FUSION (Session 3)
-# =========================================================================
-
 def reciprocal_rank_fusion(dense_results, bm25_results, top_k=TOP_K, k=60):
-    """
-    Merge dense and BM25 results using Reciprocal Rank Fusion (RRF).
-
-    RRF score = Σ 1 / (k + rank_in_list)
-
-    k=60 is the standard constant that dampens the impact of very high ranks.
-    A chunk that's #1 in both lists scores much higher than #1 in one list only.
-    """
-    scores = {}  # chunk id → accumulated RRF score
-    chunk_map = {}  # chunk id → chunk dict
-
+    scores = {}
+    chunk_map = {}
     for rank, chunk in enumerate(dense_results):
         cid = chunk["id"]
         scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
         chunk_map[cid] = chunk
-
     for rank, chunk in enumerate(bm25_results):
         cid = chunk["id"]
         scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
         if cid not in chunk_map:
             chunk_map[cid] = chunk
-
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-
     results = []
     for cid, rrf_score in ranked:
         chunk = chunk_map[cid].copy()
         chunk["rrf_score"] = round(rrf_score, 6)
         results.append(chunk)
-
     return results
 
 
-# =========================================================================
-# HYBRID RETRIEVE (Session 3)
-# =========================================================================
-
 @observe(name="retrieval_hybrid")
 def hybrid_retrieve(query, query_embedding, top_k=TOP_K):
-    """
-    Full hybrid pipeline:
-      1. Dense retrieval (3× top_k candidates)
-      2. BM25 retrieval (3× top_k candidates)
-      3. RRF fusion → top_k final results
-    """
     bm25, all_chunks = build_bm25_index()
-
-    dense_results = retrieve.__wrapped__(query_embedding, top_k=BM25_CANDIDATES)
+    # Call retrieve without the @observe decorator wrapper to avoid double-tracing
+    dense = retrieve.__wrapped__(query_embedding, top_k=BM25_CANDIDATES)
     bm25_results = bm25_retrieve(query, bm25, all_chunks, top_k=BM25_CANDIDATES)
-    fused = reciprocal_rank_fusion(dense_results, bm25_results, top_k=top_k)
-
+    fused = reciprocal_rank_fusion(dense, bm25_results, top_k=top_k)
     langfuse_context.update_current_observation(metadata={
-        "mode": "hybrid",
-        "dense_candidates": len(dense_results),
-        "bm25_candidates": len(bm25_results),
-        "fused_results": len(fused),
+        "mode": "hybrid", "fused": len(fused),
         "results": [{"doc_name": r["doc_name"], "rrf_score": r.get("rrf_score")} for r in fused],
     })
     return fused
 
 
 # =========================================================================
-# CONTEXT ASSEMBLY
+# CONTEXT ASSEMBLY (shared)
 # =========================================================================
 
 @observe(name="context_assembly")
 def assemble_context(retrieved_chunks):
-    context_parts = []
-    for chunk in retrieved_chunks:
-        context_parts.append(
-            f"[Source: {chunk['doc_name']}, Chunk {chunk['chunk_index']}]\n{chunk['content']}"
-        )
-    context = "\n\n---\n\n".join(context_parts)
+    parts = [
+        f"[Source: {c['doc_name']}, Chunk {c['chunk_index']}]\n{c['content']}"
+        for c in retrieved_chunks
+    ]
+    context = "\n\n---\n\n".join(parts)
     langfuse_context.update_current_observation(metadata={
-        "num_chunks": len(retrieved_chunks),
-        "total_context_chars": len(context),
+        "num_chunks": len(retrieved_chunks), "total_chars": len(context),
     })
     return context
 
@@ -266,8 +211,7 @@ def generate(query, context):
         metadata={"model": GENERATION_MODEL,
                   "prompt_tokens": response.usage.prompt_tokens,
                   "completion_tokens": response.usage.completion_tokens},
-        usage={"input": response.usage.prompt_tokens,
-               "output": response.usage.completion_tokens,
+        usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens,
                "total": response.usage.total_tokens, "unit": "TOKENS"},
     )
     return answer
@@ -284,19 +228,16 @@ def ask(query, mode="dense"):
 
     Args:
         query: The user question
-        mode: "dense" (default, Week 1 baseline) or "hybrid" (Session 3)
-
-    Returns:
-        dict with query, answer, retrieved_chunks, context, trace_id, elapsed_seconds
+        mode: "dense" | "hybrid" | "advanced"
     """
     start_time = time.time()
-    langfuse_context.update_current_trace(
-        input=query, metadata={"pipeline": f"rag_{mode}", "top_k": TOP_K}
-    )
+    langfuse_context.update_current_trace(input=query, metadata={"pipeline": f"rag_{mode}"})
 
     query_embedding = embed_query(query)
 
-    if mode == "hybrid":
+    if mode == "advanced":
+        return _ask_advanced(query, query_embedding, start_time)
+    elif mode == "hybrid":
         retrieved_chunks = hybrid_retrieve(query, query_embedding)
     else:
         retrieved_chunks = retrieve(query_embedding)
@@ -305,9 +246,7 @@ def ask(query, mode="dense"):
     answer = generate(query, context)
 
     elapsed = round(time.time() - start_time, 2)
-    langfuse_context.update_current_trace(
-        output=answer, metadata={"elapsed_seconds": elapsed, "mode": mode}
-    )
+    langfuse_context.update_current_trace(output=answer, metadata={"elapsed_seconds": elapsed})
     trace_id = langfuse_context.get_current_trace_id()
     langfuse.flush()
 
@@ -318,23 +257,71 @@ def ask(query, mode="dense"):
     }
 
 
+def _ask_advanced(query, query_embedding, start_time):
+    """
+    Full Session 4 pipeline:
+      hybrid retrieve → rerank → dedup + expand + compress → generate
+    """
+    from reranker import rerank
+    from context_assembler import assemble_advanced
+
+    # Stage 1: Hybrid retrieval (wider candidate set for re-ranker)
+    candidates = hybrid_retrieve(query, query_embedding, top_k=TOP_K * 2)
+
+    # Stage 2: Re-rank with cross-encoder
+    reranked = rerank(query, candidates, top_n=TOP_K + 2)
+
+    # Stage 3: Context assembly (dedup + expand + compress)
+    context, final_chunks = assemble_advanced(
+        reranked, conn_fn=get_connection, max_chars=4000, expand_window=1
+    )
+
+    # Stage 4: Generate
+    answer = generate(query, context)
+
+    elapsed = round(time.time() - start_time, 2)
+    langfuse_context.update_current_trace(
+        output=answer, metadata={"elapsed_seconds": elapsed, "mode": "advanced",
+                                 "stages": {"candidates": len(candidates),
+                                            "reranked": len(reranked),
+                                            "final": len(final_chunks)}}
+    )
+    trace_id = langfuse_context.get_current_trace_id()
+    langfuse.flush()
+
+    return {
+        "query": query, "answer": answer,
+        "retrieved_chunks": final_chunks, "context": context,
+        "trace_id": trace_id, "elapsed_seconds": elapsed, "mode": "advanced",
+        "pipeline_stages": {"candidates": len(candidates), "reranked": len(reranked),
+                            "final": len(final_chunks)},
+    }
+
+
 def ask_hybrid(query):
-    """Convenience wrapper — hybrid retrieval mode."""
     return ask(query, mode="hybrid")
+
+
+def ask_advanced(query):
+    return ask(query, mode="advanced")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["dense", "hybrid"], default="dense")
-    parser.add_argument("--query", default="What is the standard return window for products?")
+    parser.add_argument("--mode", choices=["dense", "hybrid", "advanced"], default="dense")
+    parser.add_argument("--query", default="What is the return window for premium members during Diwali sale?")
     args = parser.parse_args()
 
     result = ask(args.query, mode=args.mode)
     print(f"\nQuery: {result['query']}")
     print(f"Mode:  {result['mode']}")
-    print(f"Answer: {result['answer']}")
-    print(f"Trace: {result['trace_id']}")
-    print(f"Time: {result['elapsed_seconds']}s")
-    for i, c in enumerate(result["retrieved_chunks"]):
-        score_key = "rrf_score" if "rrf_score" in c else "similarity"
-        print(f"  [{i+1}] {c['doc_name']} (chunk {c['chunk_index']}) — {score_key}: {c.get(score_key)}")
+    print(f"Time:  {result['elapsed_seconds']}s")
+    if "pipeline_stages" in result:
+        s = result["pipeline_stages"]
+        print(f"Stages: {s['candidates']} candidates → {s['reranked']} reranked → {s['final']} final")
+    print(f"\nAnswer: {result['answer']}")
+    print(f"\nChunks used:")
+    for i, c in enumerate(result["retrieved_chunks"], 1):
+        score = c.get("rerank_score", c.get("rrf_score", c.get("similarity", 0)))
+        tag = " [expanded]" if c.get("is_expanded") else ""
+        print(f"  [{i}] {c['doc_name']} chunk {c['chunk_index']}{tag} — {score:.4f}")

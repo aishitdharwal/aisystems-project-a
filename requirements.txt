@@ -5,3 +5,4 @@ pgvector
 python-dotenv
 rich
 rank_bm25
+cohere
